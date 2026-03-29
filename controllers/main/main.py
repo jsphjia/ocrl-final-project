@@ -10,7 +10,7 @@ from util import *
 from your_controller import CustomController
 from evaluation import evaluation
 
-trajectory = getTrajectory('buggyTrace.csv')
+trajectory = getTrajectory('raceline_xy.csv')
 
 # Instantiate supervisor and functions
 driver = Driver()
