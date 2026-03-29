@@ -31,8 +31,11 @@ def getTrajectory(filename):
         trajectory = np.zeros((len(lines), 2))
         for idx, line in enumerate(lines):
             x = line.split(",")
-            trajectory[idx, 0] = x[0]
-            trajectory[idx, 1] = x[1]
+            if idx == 0:
+                continue
+            else:
+                trajectory[idx, 0] = x[0]
+                trajectory[idx, 1] = x[1]
     return trajectory
 
 class DisplayUpdate:
