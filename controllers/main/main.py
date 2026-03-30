@@ -14,6 +14,7 @@ trajectory = getTrajectory('raceline_xy.csv')
 
 N_LAPS = 3  # change to however many laps you want
 lapCount = 0
+lapCooldown = False
 
 # Instantiate supervisor and functions
 driver = Driver()
@@ -25,7 +26,7 @@ msToKmh = 3.6
 # Access and set up displays
 console = driver.getDevice("console")
 speedometer = driver.getDevice("speedometer")
-console.setFont("Arial Black", 14, True)
+console.setFont("Arial Black", 10, True)
 speedometerGraphic = speedometer.imageLoad("speedometer.png")
 speedometer.imagePaste(speedometerGraphic, 0, 0, True)
 
@@ -71,7 +72,7 @@ while driver.step() != -1:
     disError, nearIdx = closestNode(X, Y, trajectory)
     
     consoleObject.consoleUpdate(disError, nearIdx)
-    console.drawText("SoC: " + str(round(batterySoc, 1)) + "%", 5, 95)
+    console.drawText("SoC: " + str(round(batterySoc, 1)) + "%", 5, 80)
     speedometerObject.speedometerUpdate(speedometerGraphic, xdot*msToKmh)
 
     stepToMiddle = nearIdx - len(trajectory)/2.0
@@ -79,13 +80,18 @@ while driver.step() != -1:
         passMiddlePoint = True
         
     if passMiddlePoint == True:
-        console.drawText("Middle point passed.", 5, 60)
+        console.drawText("Middle point passed.", 5, 40)
         
     nearGoal = nearIdx >= len(trajectory) - 50
-    if nearGoal and passMiddlePoint:
+    
+    if not nearGoal:
+        lapCooldown = False  # reset cooldown once car moves away from finish
+    
+    if nearGoal and passMiddlePoint and not lapCooldown:
         lapCount += 1
+        lapCooldown = True
         if lapCount >= N_LAPS:
-            console.drawText("Middle point passed.\n\nDestination reached! :)", 5, 60)
+            console.drawText("Destination reached! :)", 5, 50)
             finalPosition = trajectory[-25]
             finish = True
             break
