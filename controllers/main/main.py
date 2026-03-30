@@ -12,6 +12,9 @@ from evaluation import evaluation
 
 trajectory = getTrajectory('raceline_xy.csv')
 
+N_LAPS = 3  # change to however many laps you want
+lapCount = 0
+
 # Instantiate supervisor and functions
 driver = Driver()
 driver.setDippedBeams(True)
@@ -80,10 +83,16 @@ while driver.step() != -1:
         
     nearGoal = nearIdx >= len(trajectory) - 50
     if nearGoal and passMiddlePoint:
-        console.drawText("Middle point passed.\n\nDestination reached! :)", 5, 60)
-        finalPosition = trajectory[-25]
-        finish = True
-        break
+        lapCount += 1
+        if lapCount >= N_LAPS:
+            console.drawText("Middle point passed.\n\nDestination reached! :)", 5, 60)
+            finalPosition = trajectory[-25]
+            finish = True
+            break
+        else:
+            console.drawText(f"Lap {lapCount} complete!", 5, 60)
+            passMiddlePoint = False
+            nearGoal = False
         
     XVec.append(X)
     YVec.append(Y)
