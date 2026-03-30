@@ -65,7 +65,7 @@ class DisplayUpdate:
         y = int(-needleLength * np.sin(alpha))
         self.display.drawLine(100, 95, 100 + x, 95 + y)
 
-def showResult(traj, timestep, X, Y, delta, xdot, ydot, F, psi, psidot, minDist):
+def showResult(traj, timestep, X, Y, delta, xdot, ydot, F, psi, psidot, minDist, batterySoc=None):
     # Function to plot the entire history of the car
     # Plot - X v/s Y
     # Plot - time (s) vs. delta (rad)
@@ -124,6 +124,16 @@ def showResult(traj, timestep, X, Y, delta, xdot, ydot, F, psi, psidot, minDist)
     avgDist = sum(minDist) / len(minDist)
     print('maxMinDist: ', max(minDist))
     print('avgMinDist: ', avgDist)
+
+    if batterySoc is not None and len(batterySoc) > 2:
+        plt.figure(figsize=(8, 4))
+        plt.xlabel('Time (s)')
+        plt.ylabel('Battery SoC (%)')
+        plt.title('Battery State of Charge')
+        plt.plot(totalTime[2:], batterySoc[2:], 'g', linewidth=2.0)
+        plt.ylim([0, 100])
+        plt.grid(True, alpha=0.3)
+
     plt.show()
 
 def visualizePath(cost_map, path):

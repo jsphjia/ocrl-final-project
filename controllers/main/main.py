@@ -45,6 +45,7 @@ ydotVec = []
 psiVec = []
 psidotVec = []
 FVec = []
+batterySocVec = []
 minDist = []
 passMiddlePoint = False
 nearGoal = False
@@ -53,17 +54,21 @@ finish = False
 while driver.step() != -1:
 
     # Call control update method
-    X, Y, xdot, ydot, psi, psidot, F, delta = \
+    X, Y, xdot, ydot, psi, psidot, F, delta, batterySoc = \
     customController.update(timestep)
 
     # Set control update output
-    driver.setThrottle(clamp(F/throttleConversion, 0, 1))
+    throttleCmd = clamp(F/throttleConversion, 0, 1)
+    brakeCmd = clamp(-F/throttleConversion, 0, 1)
+    driver.setThrottle(throttleCmd)
+    driver.setBrakeIntensity(brakeCmd)
     driver.setSteeringAngle(-clamp(delta, np.radians(-30), np.radians(30)))
     
     # Check for halfway point/completion
     disError, nearIdx = closestNode(X, Y, trajectory)
     
     consoleObject.consoleUpdate(disError, nearIdx)
+    console.drawText("SoC: " + str(round(batterySoc, 1)) + "%", 5, 95)
     speedometerObject.speedometerUpdate(speedometerGraphic, xdot*msToKmh)
 
     stepToMiddle = nearIdx - len(trajectory)/2.0
@@ -88,6 +93,7 @@ while driver.step() != -1:
     psiVec.append(psi)
     psidotVec.append(psidot)
     FVec.append(F)
+    batterySocVec.append(batterySoc)
     minDist.append(disError)
     
 # Reset position and physics once loop is completed,
@@ -98,4 +104,4 @@ if finish:
     evaluation(minDist, trajectory, XVec, YVec)
     showResult(trajectory, timestep, \
                XVec, YVec, deltaVec, xdotVec, ydotVec, \
-               FVec, psiVec, psidotVec, minDist)
+               FVec, psiVec, psidotVec, minDist, batterySocVec)
