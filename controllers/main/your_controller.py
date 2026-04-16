@@ -1,17 +1,22 @@
 # Fill in the respective functions to implement the controller
 
 # Import libraries
+import os
+from pathlib import Path
 import numpy as np
 from base_controller import BaseController
 from scipy import signal, linalg
+from policy_features import PolicyFeatureConfig, build_policy_features
+from supervised_policy import SupervisedPolicy
 from util import closestNode, wrapToPi
 
 # CustomController class (inherits from BaseController)
 class CustomController(BaseController):
 
-    def __init__(self, trajectory):
+    def __init__(self, trajectory, expert_logger=None):
 
         super().__init__(trajectory)
+        self.expert_logger = expert_logger
 
         # Define constants
         self.lr = 1.39
@@ -60,6 +65,20 @@ class CustomController(BaseController):
         self.deploy_over_target_margin_mps = 10.0
         self.deploy_force_gain = 1800.0
         self.deploy_soc_min = 25.0
+        self.LOOKAHEAD_NODES = 120 # lookahead parameter
+
+        # Safer defaults for data collection so the car can complete laps reliably.
+        self.learning_safe_mode = os.environ.get("LEARNING_SAFE_MODE", "1") == "1"
+        if self.learning_safe_mode:
+            self.max_speed_mps = 24.0
+            self.min_turn_speed_mps = 7.0
+            self.LOOKAHEAD_NODES = 90
+            self.turn_brake_gain = 5200.0
+            self.approach_decel = 3.5
+            self.preview_safety_margin_m = 120.0
+            self.deploy_force_gain = 800.0
+            self.deploy_over_target_margin_mps = 4.0
+            self.straight_boost_max = 0.12
 
         # Mean path spacing used to convert preview node offsets to metric distance.
         seg = np.diff(trajectory, axis=0)
@@ -70,11 +89,53 @@ class CustomController(BaseController):
         self.battery_soc = 100.0
         self.battery_soc_min = 0.0
         self.battery_soc_max = 100.0
-        self.battery_discharge_rate = 2.5  # %/s at full throttle
-        self.battery_high_power_penalty = 0.7
+        self.battery_empty_threshold = float(os.environ.get("BATTERY_EMPTY_THRESHOLD", "0.5"))
+        # Battery profile presets:
+        # aggressive_train -> strongest pressure to learn deployment timing
+        # medium_train     -> transition profile after aggressive phase
+        # deploy           -> final competition/runtime profile
+        battery_profile = os.environ.get("BATTERY_PROFILE", "aggressive_train").strip().lower()
+        battery_profiles = {
+            "aggressive_train": {
+                "discharge_rate": 2.5,
+                "regen_rate": 11.0,
+                "high_power_penalty": 0.9,
+                "regen_multiplier": 0.28,
+            },
+            "medium_train": {
+                "discharge_rate": 3.3,
+                "regen_rate": 13.0,
+                "high_power_penalty": 0.8,
+                "regen_multiplier": 0.38,
+            },
+            "deploy": {
+                "discharge_rate": 2.2,
+                "regen_rate": 17.0,
+                "high_power_penalty": 0.7,
+                "regen_multiplier": 0.6,
+            },
+        }
+        if battery_profile not in battery_profiles:
+            battery_profile = "aggressive_train"
+        profile_cfg = battery_profiles[battery_profile]
+
+        self.battery_discharge_rate = profile_cfg["discharge_rate"]
+        self.battery_high_power_penalty = profile_cfg["high_power_penalty"]
+        self.battery_regen_multiplier = profile_cfg["regen_multiplier"]
         self.straight_deploy_multiplier = 0.95
         self.straight_deploy_soc_min = 20.0
-        self.battery_regen_rate = 18.0     # %/s at normalized peak regen power
+        self.battery_regen_rate = profile_cfg["regen_rate"]
+        # Battery discharge applies only above this threshold (mph).
+        free_accel_mph = 25.0
+        self.battery_free_accel_speed_mps = free_accel_mph * 0.44704
+        # Baseline speed-dependent drain above free-acceleration threshold.
+        # This avoids flat SoC at high-speed cruise when throttle command is small.
+        self.battery_speed_discharge_rate = float(
+            os.environ.get("BATTERY_SPEED_DISCHARGE_RATE", "2.0")
+        )
+        # At empty SoC, hold this cruise cap (mph) so the car can keep circulating.
+        empty_cap_mph = 15.0
+        self.empty_soc_speed_cap_mps = empty_cap_mph * 0.44704
         self.battery_regen_efficiency = 0.95
         self.regen_reference_speed = 14.0
         self.regen_force_cap = 8500.0
@@ -84,12 +145,52 @@ class CustomController(BaseController):
         self.corner_regen_gain = 1.25
         self.max_longitudinal_force = 10000.0
         self.prev_speed = 0.0
+        self.prev_node_index = None
+        self.no_progress_time = 0.0
+        self.recovery_time_left = 0.0
+
+        # Optional learned-policy control for longitudinal force.
+        self.use_supervised_policy = os.environ.get("USE_SUPERVISED_POLICY", "0") == "1"
+        self.supervised_blend = float(os.environ.get("SUPERVISED_BLEND", "0.85"))
+        self.supervised_blend = float(np.clip(self.supervised_blend, 0.0, 1.0))
+        self.supervised_policy = None
+        if self.use_supervised_policy:
+            model_dir = Path(
+                os.environ.get(
+                    "SUPERVISED_MODEL_DIR",
+                    str(Path(__file__).resolve().parent / "models" / "supervised"),
+                )
+            )
+            try:
+                self.supervised_policy = SupervisedPolicy(model_dir=model_dir)
+            except Exception:
+                # Fall back to analytic controller if model artifacts are unavailable.
+                self.use_supervised_policy = False
 
         # lateral controller parameters
         self.Kp_lat = 1.6         # P
         self.Ki_lat = 0.0001      # I
         self.Kd_lat = 1.1         # D
-        self.LOOKAHEAD_NODES = 120 # lookahead parameter
+
+        self.policy_feature_config = PolicyFeatureConfig(
+            max_speed_mps=self.max_speed_mps,
+            preview_offsets=tuple(self.preview_offsets),
+            preview_segment_nodes=self.preview_segment_nodes,
+            min_turn_speed_mps=self.min_turn_speed_mps,
+            a_lat_limit=self.a_lat_limit,
+            approach_decel=self.approach_decel,
+            preview_safety_margin_m=self.preview_safety_margin_m,
+            approach_speed_buffer=self.approach_speed_buffer,
+            first_corner_nodes=self.first_corner_nodes,
+            first_corner_ramp_nodes=self.first_corner_ramp_nodes,
+            first_corner_speed_cap_mps=self.first_corner_speed_cap_mps,
+            straight_heading_ref=self.straight_heading_ref,
+            straight_soc_threshold=self.straight_soc_threshold,
+            battery_soc_max=self.battery_soc_max,
+            deploy_heading_margin=self.deploy_heading_margin,
+            deploy_crosstrack_margin=self.deploy_crosstrack_margin,
+            turn_detect_heading_threshold=self.turn_detect_heading_threshold,
+        )
 
     def update(self, timestep):
 
@@ -110,6 +211,17 @@ class CustomController(BaseController):
 
         # --------------------|Turn-aware Speed Planning|-------------------------
         cross_track_error, current_node_index = closestNode(X, Y, trajectory)
+
+        if self.prev_node_index is None:
+            self.prev_node_index = current_node_index
+
+        node_advance = (current_node_index - self.prev_node_index) % max(len(trajectory), 1)
+        made_progress = node_advance > 2
+        if made_progress:
+            self.no_progress_time = 0.0
+        else:
+            self.no_progress_time += delT
+        self.prev_node_index = current_node_index
 
         N = len(trajectory)
         target_node_index = int((current_node_index + self.LOOKAHEAD_NODES) % N)
@@ -183,6 +295,15 @@ class CustomController(BaseController):
                 1.0,
             )
             early_corner_cap = self.first_corner_speed_cap_mps + blend * (self.max_speed_mps - self.first_corner_speed_cap_mps)
+
+            # On near-straight launch segments, do not get pinned below the
+            # free-acceleration speed threshold before battery discharge starts.
+            if max_heading_change < self.turn_detect_heading_threshold:
+                early_corner_cap = max(
+                    early_corner_cap,
+                    min(self.battery_free_accel_speed_mps, self.max_speed_mps),
+                )
+
             self.V_target = min(self.V_target, early_corner_cap)
             corner_feasible_speed = min(corner_feasible_speed, early_corner_cap)
 
@@ -239,6 +360,22 @@ class CustomController(BaseController):
             deploy_headroom = deploy_speed_ceiling - V
             F += self.deploy_force_gain * deploy_track_factor * soc_factor * deploy_headroom
 
+        if self.use_supervised_policy and self.supervised_policy is not None:
+            ml_F, _ = self.supervised_policy.predict_from_state(
+                trajectory=trajectory,
+                X=X,
+                Y=Y,
+                xdot=xdot,
+                ydot=ydot,
+                psi=psi,
+                psidot=psidot,
+                battery_soc=self.battery_soc,
+                config=self.policy_feature_config,
+                current_node_index=current_node_index,
+            )
+            ml_F = np.clip(ml_F, -self.max_longitudinal_force, self.max_longitudinal_force)
+            F = (1.0 - self.supervised_blend) * F + self.supervised_blend * ml_F
+
         # Brake only when trajectory preview indicates corner entry is too fast.
         speed_excess = V - corner_feasible_speed
         if brake_required and speed_excess > self.turn_brake_deadband:
@@ -251,8 +388,10 @@ class CustomController(BaseController):
         # limit F
         F = np.clip(F, -self.max_longitudinal_force, self.max_longitudinal_force)
 
-        # Battery cannot discharge below 0%; block positive propulsion when empty.
-        if self.battery_soc <= self.battery_soc_min and F > 0.0:
+        battery_empty = self.battery_soc <= max(self.battery_soc_min, self.battery_empty_threshold)
+
+        # When SoC is empty, do not accelerate beyond the empty-SoC cap speed.
+        if battery_empty and V >= self.empty_soc_speed_cap_mps and F > 0.0:
             F = 0.0
 
         throttle_fraction = np.clip(F / self.max_longitudinal_force, 0.0, 1.0)
@@ -261,6 +400,19 @@ class CustomController(BaseController):
         effective_discharge = self.battery_discharge_rate * (
             throttle_fraction + self.battery_high_power_penalty * throttle_fraction**2
         )
+
+        # No discharge at/under threshold speed; full discharge above threshold.
+        speed_gate = 1.0 if V > self.battery_free_accel_speed_mps else 0.0
+        effective_discharge *= speed_gate
+
+        # Additional parasitic drain above threshold, even at low throttle.
+        speed_excess_ratio = np.clip(
+            (V - self.battery_free_accel_speed_mps)
+            / max(self.battery_free_accel_speed_mps, 1e-6),
+            0.0,
+            1.0,
+        )
+        effective_discharge += self.battery_speed_discharge_rate * speed_gate * (0.5 + 1.5 * speed_excess_ratio)
 
         # Aggressive energy deployment on straights when SoC is healthy.
         if throttle_fraction > 0.0 and self.battery_soc > self.straight_deploy_soc_min:
@@ -276,10 +428,17 @@ class CustomController(BaseController):
         regen_fraction *= (1.0 + self.regen_brake_bias * brake_fraction)
         regen_fraction = np.clip(regen_fraction, 0.0, 1.0)
         effective_regen = self.battery_regen_rate * self.battery_regen_efficiency * regen_fraction
+        effective_regen *= self.battery_regen_multiplier
 
         # Extra corner regen weighting so heavy corner braking can recover large SoC chunks.
         corner_factor = np.clip(max_heading_change / max(self.corner_regen_heading_ref, 1e-6), 0.0, 1.0)
         effective_regen *= (1.0 + self.corner_regen_gain * corner_factor * (0.4 + 0.6 * brake_fraction))
+
+        # Strong braking should recover energy, but not enough to cancel sustained cruise drain.
+        if brake_fraction > 0.15:
+            effective_regen *= 1.0 + 0.75 * brake_fraction
+        else:
+            effective_regen *= 0.35
 
         soc_delta = (
             effective_regen
@@ -330,11 +489,67 @@ class CustomController(BaseController):
         # apply steering limit
         delta = np.clip(delta, -0.5, 0.5)
 
-        # If battery is depleted, do not allow speed to increase.
-        if self.battery_soc <= self.battery_soc_min and V > self.prev_speed:
-            F = min(F, -1000.0)
+        # At empty SoC, regulate speed to the empty-SoC cap.
+        if battery_empty:
+            speed_error_empty = self.empty_soc_speed_cap_mps - V
+            if speed_error_empty >= 0.0:
+                # Below cap: only gently approach the cap; do not exceed it.
+                F_empty = np.clip(900.0 * speed_error_empty, 0.0, 1800.0)
+            else:
+                # Above cap: gently brake back to capped speed.
+                F_empty = np.clip(1800.0 * speed_error_empty, -4500.0, 0.0)
+            F = F_empty
+
+        # Recovery behavior for low-speed stalls so data collection can continue.
+        stuck_condition = self.no_progress_time > 2.2 and V < 1.5
+        if stuck_condition and self.recovery_time_left <= 0.0:
+            self.recovery_time_left = 1.2
+            self.no_progress_time = 0.0
+
+        if self.recovery_time_left > 0.0 and not battery_empty:
+            F = max(F, 3200.0)
+            delta = np.clip(1.4 * e_psi, -0.45, 0.45)
+            self.recovery_time_left = max(self.recovery_time_left - delT, 0.0)
+
+        # Final empty-battery safeguard: never allow positive force above the cap,
+        # and only permit gentle approach toward the cap when below it.
+        if battery_empty:
+            if V >= self.empty_soc_speed_cap_mps:
+                F = min(F, 0.0)
+            else:
+                speed_error_empty = self.empty_soc_speed_cap_mps - V
+                F = min(F, np.clip(900.0 * speed_error_empty, 0.0, 1800.0))
 
         self.prev_speed = V
+
+        if self.expert_logger is not None:
+            feature_row = build_policy_features(
+                trajectory=trajectory,
+                X=X,
+                Y=Y,
+                xdot=xdot,
+                ydot=ydot,
+                psi=psi,
+                psidot=psidot,
+                battery_soc=self.battery_soc,
+                config=self.policy_feature_config,
+                current_node_index=current_node_index,
+            )
+            self.expert_logger.log(
+                {
+                    **feature_row,
+                    "x": X,
+                    "y": Y,
+                    "xdot": xdot,
+                    "ydot": ydot,
+                    "psi": psi,
+                    "throttle_fraction": throttle_fraction,
+                    "brake_fraction": brake_fraction,
+                    "F_cmd": F,
+                    "delta_cmd": delta,
+                    "delT": delT,
+                }
+            )
 
         # Return all states and calculated control inputs (F, delta, battery SoC)
         return X, Y, xdot, ydot, psi, psidot, F, delta, self.battery_soc

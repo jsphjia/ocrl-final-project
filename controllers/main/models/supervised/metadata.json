@@ -1,0 +1,32 @@
+{
+  "feature_columns": [
+    "speed_norm",
+    "psidot",
+    "cross_track_error_norm",
+    "heading_error",
+    "track_heading_error",
+    "battery_soc_norm",
+    "track_progress",
+    "v_target_norm",
+    "corner_feasible_speed_norm",
+    "preview_speed_limit_norm",
+    "max_heading_change",
+    "distance_to_turn_start_norm",
+    "deploy_track_factor",
+    "soc_factor",
+    "brake_required"
+  ],
+  "target_columns": [
+    "F_cmd",
+    "delta_cmd"
+  ],
+  "n_rows_total": 390910,
+  "n_rows_train": 326863,
+  "n_rows_val": 64047,
+  "metrics": {
+    "F_mae": 624.1356536524036,
+    "delta_mae": 0.2961482262497129,
+    "F_r2": 0.7647045891923983,
+    "delta_r2": -35.433260547684334
+  }
+}

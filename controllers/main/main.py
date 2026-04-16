@@ -1,6 +1,9 @@
 # This file should be set as the controller for the Tesla robot node.
 # Please do not alter this file - it may cause the simulation to fail.
 
+import os
+from pathlib import Path
+
 # Import Webots-specific functions
 from controller import Display
 from vehicle import Driver
@@ -9,12 +12,17 @@ from vehicle import Driver
 from util import *
 from your_controller import CustomController
 from evaluation import evaluation
+from sl_dataset import ExpertDataLogger
 
-trajectory = getTrajectory('raceline_xy.csv')
+TRACK_FILE = os.environ.get("TRACK_FILE", "raceline_xy.csv")
+trajectory = getTrajectory(TRACK_FILE)
 
 N_LAPS = 3  # change to however many laps you want
 lapCount = 0
 lapCooldown = False
+ENABLE_EXPERT_LOG = os.environ.get("EXPERT_LOG", "1") == "1"
+EXPERT_LOG_DIR = Path(__file__).resolve().parent / "data" / "expert" / Path(TRACK_FILE).stem
+expertLogger = ExpertDataLogger(EXPERT_LOG_DIR, track_name=Path(TRACK_FILE).stem) if ENABLE_EXPERT_LOG else None
 
 # Instantiate supervisor and functions
 driver = Driver()
@@ -37,7 +45,7 @@ speedometerObject = DisplayUpdate(speedometer)
 timestep = int(driver.getBasicTimeStep())
 
 # Instantiate controller and start sensors
-customController = CustomController(trajectory)
+customController = CustomController(trajectory, expert_logger=expertLogger)
 customController.startSensors(timestep)
 
 # Initialize state storage vectors and completion conditions
@@ -120,3 +128,6 @@ if finish:
     showResult(trajectory, timestep, \
                XVec, YVec, deltaVec, xdotVec, ydotVec, \
                FVec, psiVec, psidotVec, minDist, batterySocVec)
+
+if expertLogger is not None:
+    expertLogger.close()
