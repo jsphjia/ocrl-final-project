@@ -1,0 +1,56 @@
+{
+  "mlp": {
+    "hidden_layer_sizes": [128, 128],
+    "activation": "relu",
+    "learning_rate_init": 0.001,
+    "max_iter": 300,
+    "early_stopping": true,
+    "random_state": 42
+  },
+  "pid_longitudinal": {
+    "Kp": 990.0,
+    "Ki": 10.0,
+    "Kd": 100.0
+  },
+  "pid_lateral": {
+    "Kp": 1.6,
+    "Ki": 0.0001,
+    "Kd": 1.1
+  },
+  "battery_profiles": {
+    "aggressive_train": {
+      "discharge_rate": 2.5,
+      "regen_rate": 11.0,
+      "high_power_penalty": 0.9,
+      "regen_multiplier": 0.28
+    },
+    "medium_train": {
+      "discharge_rate": 3.3,
+      "regen_rate": 13.0,
+      "high_power_penalty": 0.8,
+      "regen_multiplier": 0.38
+    },
+    "deploy": {
+      "discharge_rate": 2.2,
+      "regen_rate": 17.0,
+      "high_power_penalty": 0.7,
+      "regen_multiplier": 0.6
+    }
+  },
+  "battery_params": {
+    "straight_deploy_multiplier": 0.95,
+    "straight_deploy_soc_min": 20.0,
+    "battery_free_accel_speed_mps": 11.176,
+    "battery_speed_discharge_rate": 2.0,
+    "battery_regen_efficiency": 0.95,
+    "regen_reference_speed": 14.0,
+    "regen_force_cap": 8500.0,
+    "regen_nonlinear_exponent": 0.5,
+    "regen_brake_bias": 0.9,
+    "corner_regen_heading_ref": 0.18,
+    "corner_regen_gain": 1.25,
+    "battery_soc_max": 100.0,
+    "battery_soc_min": 0.0,
+    "battery_empty_threshold": 0.5
+  }
+}
