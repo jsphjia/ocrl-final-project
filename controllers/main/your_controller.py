@@ -7,7 +7,6 @@ import numpy as np
 from base_controller import BaseController
 from scipy import signal, linalg
 from policy_features import PolicyFeatureConfig, build_policy_features
-from supervised_policy import SupervisedPolicy
 from util import closestNode, wrapToPi
 
 # CustomController class (inherits from BaseController)
@@ -149,23 +148,13 @@ class CustomController(BaseController):
         self.no_progress_time = 0.0
         self.recovery_time_left = 0.0
 
-        # Optional learned-policy control for longitudinal force.
-        self.use_supervised_policy = os.environ.get("USE_SUPERVISED_POLICY", "0") == "1"
-        self.supervised_blend = float(os.environ.get("SUPERVISED_BLEND", "0.85"))
-        self.supervised_blend = float(np.clip(self.supervised_blend, 0.0, 1.0))
-        self.supervised_policy = None
-        if self.use_supervised_policy:
-            model_dir = Path(
-                os.environ.get(
-                    "SUPERVISED_MODEL_DIR",
-                    str(Path(__file__).resolve().parent / "models" / "supervised"),
-                )
-            )
-            try:
-                self.supervised_policy = SupervisedPolicy(model_dir=model_dir)
-            except Exception:
-                # Fall back to analytic controller if model artifacts are unavailable.
-                self.use_supervised_policy = False
+        # Optimizer-based policy for longitudinal force.
+        # MLP-based supervised policy removed from runtime. Use optimizer instead.
+        self.use_optimizer = os.environ.get("USE_OPTIMIZER", "0") == "1"
+        # blend factor between analytic PID and optimizer output (0=PID only,1=optimizer only)
+        blend_env = os.environ.get("OPTIMIZER_BLEND", os.environ.get("SUPERVISED_BLEND", "0.85"))
+        self.optimizer_blend = float(np.clip(float(blend_env), 0.0, 1.0))
+        self.optimizer_info = None
 
         # lateral controller parameters
         self.Kp_lat = 1.6         # P
@@ -360,21 +349,33 @@ class CustomController(BaseController):
             deploy_headroom = deploy_speed_ceiling - V
             F += self.deploy_force_gain * deploy_track_factor * soc_factor * deploy_headroom
 
-        if self.use_supervised_policy and self.supervised_policy is not None:
-            ml_F, _ = self.supervised_policy.predict_from_state(
-                trajectory=trajectory,
-                X=X,
-                Y=Y,
-                xdot=xdot,
-                ydot=ydot,
-                psi=psi,
-                psidot=psidot,
-                battery_soc=self.battery_soc,
-                config=self.policy_feature_config,
-                current_node_index=current_node_index,
-            )
-            ml_F = np.clip(ml_F, -self.max_longitudinal_force, self.max_longitudinal_force)
-            F = (1.0 - self.supervised_blend) * F + self.supervised_blend * ml_F
+        if self.use_optimizer:
+            try:
+                from optimal_control import optimize_longitudinal
+
+                opt_F, info = optimize_longitudinal(
+                    self,
+                    trajectory=trajectory,
+                    X=X,
+                    Y=Y,
+                    xdot=xdot,
+                    ydot=ydot,
+                    psi=psi,
+                    psidot=psidot,
+                    battery_soc=self.battery_soc,
+                    config=self.policy_feature_config,
+                    current_node_index=current_node_index,
+                    delT=delT,
+                )
+                opt_F = np.clip(opt_F, -self.max_longitudinal_force, self.max_longitudinal_force)
+                self.optimizer_info = info
+                # store last optimizer outputs for logging and debugging
+                self.last_opt_F = float(opt_F)
+                self.last_opt_info = info
+                F = (1.0 - self.optimizer_blend) * F + self.optimizer_blend * opt_F
+            except Exception:
+                # optimizer failed; keep analytic PID F
+                pass
 
         # Brake only when trajectory preview indicates corner entry is too fast.
         speed_excess = V - corner_feasible_speed
@@ -387,6 +388,40 @@ class CustomController(BaseController):
 
         # limit F
         F = np.clip(F, -self.max_longitudinal_force, self.max_longitudinal_force)
+
+        # Hard SOC safeguard: prevent positive propulsion if predicted or current SOC
+        # would violate reserve. Controlled by env `MPC_HARD_ENFORCE` (default on).
+        hard_enforce = os.environ.get("MPC_HARD_ENFORCE", "1") == "1"
+        soc_reserve_env = os.environ.get("MPC_SOC_RESERVE", "")
+        try:
+            soc_reserve_val = float(soc_reserve_env) if soc_reserve_env != "" else None
+        except Exception:
+            soc_reserve_val = None
+        if soc_reserve_val is None:
+            soc_reserve_val = max(getattr(self, 'deploy_soc_min', 25.0), getattr(self, 'straight_soc_threshold', 60.0) * 0.4)
+
+        soc_enforced = False
+        if hard_enforce:
+            pred_soc = None
+            if hasattr(self, 'last_opt_info') and isinstance(self.last_opt_info, dict):
+                pred_soc = self.last_opt_info.get('pred_soc', None)
+
+            if pred_soc is not None:
+                # If predicted SOC would drop below min, kill positive force.
+                if pred_soc <= self.battery_soc_min + 0.5 and F > 0.0:
+                    F = 0.0
+                    soc_enforced = True
+                # If predicted SOC below reserve, scale throttle conservatively.
+                elif pred_soc <= soc_reserve_val and F > 0.0:
+                    reduction = (pred_soc - (self.battery_soc_min)) / max(1e-3, (soc_reserve_val - self.battery_soc_min))
+                    reduction = float(np.clip(reduction, 0.0, 1.0))
+                    F = F * reduction
+                    soc_enforced = True
+            else:
+                # Fallback conservative rule: if current SOC <= reserve, disable positive force.
+                if self.battery_soc <= soc_reserve_val and F > 0.0:
+                    F = 0.0
+                    soc_enforced = True
 
         battery_empty = self.battery_soc <= max(self.battery_soc_min, self.battery_empty_threshold)
 
@@ -535,21 +570,30 @@ class CustomController(BaseController):
                 config=self.policy_feature_config,
                 current_node_index=current_node_index,
             )
-            self.expert_logger.log(
-                {
-                    **feature_row,
-                    "x": X,
-                    "y": Y,
-                    "xdot": xdot,
-                    "ydot": ydot,
-                    "psi": psi,
-                    "throttle_fraction": throttle_fraction,
-                    "brake_fraction": brake_fraction,
-                    "F_cmd": F,
-                    "delta_cmd": delta,
-                    "delT": delT,
-                }
-            )
+            log_row = {
+                **feature_row,
+                "x": X,
+                "y": Y,
+                "xdot": xdot,
+                "ydot": ydot,
+                "psi": psi,
+                "throttle_fraction": throttle_fraction,
+                "brake_fraction": brake_fraction,
+                "F_cmd": F,
+                "delta_cmd": delta,
+                "delT": delT,
+            }
+            # attach optimizer debug info if available
+            if hasattr(self, 'last_opt_F'):
+                log_row['F_pid'] = float(((self.Kp_long * (self.V_target - V)) if True else 0.0))
+                log_row['F_opt'] = float(self.last_opt_F)
+                log_row['F_blend'] = float(self.optimizer_blend)
+                log_row['predicted_soc'] = float(self.last_opt_info.get('pred_soc')) if isinstance(self.last_opt_info, dict) and 'pred_soc' in self.last_opt_info else None
+                log_row['opt_success'] = bool(self.last_opt_info.get('success')) if isinstance(self.last_opt_info, dict) else None
+            # whether SOC enforcement modified the final F
+            log_row['soc_enforced'] = bool(soc_enforced)
+
+            self.expert_logger.log(log_row)
 
         # Return all states and calculated control inputs (F, delta, battery SoC)
         return X, Y, xdot, ydot, psi, psidot, F, delta, self.battery_soc
